@@ -12,6 +12,8 @@
 #include <faiss/IndexBinaryFlat.h>
 #include <faiss/impl/HNSW.h>
 #include <faiss/utils/utils.h>
+#include <mutex>
+#include <vector>
 
 namespace faiss {
 
@@ -36,7 +38,7 @@ struct IndexBinaryHNSW : IndexBinary {
 
     // When set to true, all neighbors in level 0 are filled up
     // to the maximum size allowed (2 * M). This option is used by
-    // IndexBinaryHNSW to create a full base layer graph that is
+    // IndexBinaryHHNSW to create a full base layer graph that is
     // used when GpuIndexBinaryCagra::copyFrom(IndexBinaryHNSW*) is called.
     bool keep_max_size_level0 = false;
 
@@ -49,9 +51,11 @@ struct IndexBinaryHNSW : IndexBinary {
     DistanceComputer* get_distance_computer() const;
 
     void add(idx_t n, const uint8_t* x) override;
+    void add(idx_t n, const void* x, NumericType numeric_type) override;
 
     /// Trains the storage if needed
     void train(idx_t n, const uint8_t* x) override;
+    void train(idx_t n, const void* x, NumericType numeric_type) override;
 
     /// entry point for search
     void search(
@@ -61,9 +65,18 @@ struct IndexBinaryHNSW : IndexBinary {
             int32_t* distances,
             idx_t* labels,
             const SearchParameters* params = nullptr) const override;
+    void search(
+            idx_t n,
+            const void* x,
+            NumericType numeric_type,
+            idx_t k,
+            int32_t* distances,
+            idx_t* labels,
+            const SearchParameters* params = nullptr) const override;
 
     void reconstruct(idx_t key, uint8_t* recons) const override;
-
+    mutable std::vector<uint16_t> pb_array_;
+    void ensure_pb_array_() const;
     void reset() override;
 };
 

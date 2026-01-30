@@ -13,18 +13,20 @@
 
 #include <faiss/utils/hamming_distance/common.h>
 
-#ifdef __aarch64__
-// ARM compilers may produce inoptimal code for Hamming distance somewhy.
-#include <faiss/utils/hamming_distance/neon-inl.h>
-#elif __AVX512F__
-// offers better performance where __AVX512VPOPCNTDQ__ is supported
+// #ifdef __aarch64__
+// // ARM compilers may produce inoptimal code for Hamming distance somewhy.
+// #include <faiss/utils/hamming_distance/neon-inl.h>
+// #elif __AVX512F__
+
+// // offers better performance where __AVX512VPOPCNTDQ__ is supported
 #include <faiss/utils/hamming_distance/avx512-inl.h>
-#elif __AVX2__
-// better versions for GenHammingComputer
-#include <faiss/utils/hamming_distance/avx2-inl.h>
-#else
-#include <faiss/utils/hamming_distance/generic-inl.h>
-#endif
+// #elif __AVX2__
+// // better versions for GenHammingComputer
+// #include <faiss/utils/hamming_distance/avx2-inl.h>
+// #else
+// #include <faiss/utils/hamming_distance/generic-inl.h>
+// #endif
+#include <iostream>
 
 namespace faiss {
 
@@ -39,21 +41,21 @@ struct HammingComputer : HammingComputerDefault {
             : HammingComputerDefault(a, code_size) {}
 };
 
-#define SPECIALIZED_HC(CODE_SIZE)                                    \
-    template <>                                                      \
-    struct HammingComputer<CODE_SIZE> : HammingComputer##CODE_SIZE { \
-        HammingComputer(const uint8_t* a)                            \
-                : HammingComputer##CODE_SIZE(a, CODE_SIZE) {}        \
-    }
+// #define SPECIALIZED_HC(CODE_SIZE)                                    \
+//     template <>                                                      \
+//     struct HammingComputer<CODE_SIZE> : HammingComputer##CODE_SIZE { \
+//         HammingComputer(const uint8_t* a)                            \
+//                 : HammingComputer##CODE_SIZE(a, CODE_SIZE) {}        \
+//     }
 
-SPECIALIZED_HC(4);
-SPECIALIZED_HC(8);
-SPECIALIZED_HC(16);
-SPECIALIZED_HC(20);
-SPECIALIZED_HC(32);
-SPECIALIZED_HC(64);
+// SPECIALIZED_HC(4);
+// SPECIALIZED_HC(8);
+// SPECIALIZED_HC(16);
+// SPECIALIZED_HC(20);
+// SPECIALIZED_HC(32);
+// SPECIALIZED_HC(64);
 
-#undef SPECIALIZED_HC
+// #undef SPECIALIZED_HC
 
 /***************************************************************************
  * Dispatching function that takes a code size and a consumer object
@@ -66,21 +68,23 @@ typename Consumer::T dispatch_HammingComputer(
         int code_size,
         Consumer& consumer,
         Types... args) {
-    switch (code_size) {
-#define DISPATCH_HC(CODE_SIZE) \
-    case CODE_SIZE:            \
-        return consumer.template f<HammingComputer##CODE_SIZE>(args...);
-        DISPATCH_HC(4);
-        DISPATCH_HC(8);
-        DISPATCH_HC(16);
-        DISPATCH_HC(20);
-        DISPATCH_HC(32);
-        DISPATCH_HC(64);
-        default:
-            return consumer.template f<HammingComputerDefault>(args...);
-    }
-#undef DISPATCH_HC
+//     switch (code_size) {
+// #define DISPATCH_HC(CODE_SIZE) \
+//     case CODE_SIZE:            \
+//         return consumer.template f<HammingComputer##CODE_SIZE>(args...);
+//         DISPATCH_HC(4);
+//         DISPATCH_HC(8);
+//         DISPATCH_HC(16);
+//         DISPATCH_HC(20);
+//         DISPATCH_HC(32);
+//         DISPATCH_HC(64);
+//         default:
+//             return consumer.template f<HammingComputerDefault>(args...);
+//     }
+    return consumer.template f<HammingComputerDefault>(args...);
+// #undef DISPATCH_HC
 }
+
 
 } // namespace faiss
 

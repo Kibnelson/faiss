@@ -26,13 +26,43 @@
 #include <faiss/utils/hamming.h>
 #include <faiss/utils/random.h>
 
+#include <xmmintrin.h>
+#include <algorithm>
 #include <random>
+
+
+#include <omp.h>
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+
+#include <cstdint>
+
 
 namespace faiss {
 
 /**************************************************************
  * add / search blocks of descriptors
  **************************************************************/
+
+
+ // --- file-scope, above namespace or inside namespace faiss ---
+static inline float fast_rcp(float x) {
+#if defined(__SSE__)
+    __m128 vx = _mm_set_ss(x);
+    __m128 r  = _mm_rcp_ss(vx);                                   // ~12-bit
+    r = _mm_mul_ss(r, _mm_sub_ss(_mm_set_ss(2.0f), _mm_mul_ss(vx, r))); // ~22-bit
+    return _mm_cvtss_f32(r);
+#else
+    return 1.0f / x;
+#endif
+}
+
+
+    std::mutex g_pb_mutex;  // one per translation unit
 
 namespace {
 
@@ -199,6 +229,10 @@ void IndexBinaryHNSW::train(idx_t n, const uint8_t* x) {
     is_trained = true;
 }
 
+void IndexBinaryHNSW::train(idx_t n, const void* x, NumericType numeric_type) {
+    IndexBinary::train(n, x, numeric_type);
+}
+
 void IndexBinaryHNSW::search(
         idx_t n,
         const uint8_t* x,
@@ -227,33 +261,56 @@ void IndexBinaryHNSW::search(
         for (idx_t i = 0; i < n; i++) {
             res.begin(i);
             dis->set_query((float*)(x + i * code_size));
-            // Given that IndexBinaryHNSW is not an IndexHNSW, we pass nullptr
-            // as the index parameter. This state does not get used in the
-            // search function, as it is merely there to to enable Panorama
-            // execution for IndexHNSWFlatPanorama.
-            hnsw.search(*dis, nullptr, res, vt);
+            hnsw.search(*dis, res, vt);
             res.end();
         }
     }
 
-#pragma omp parallel for
+// #pragma omp parallel for
+//     for (int i = 0; i < n * k; ++i) {
+//         distances[i] = std::round(distances_f[i]);
+//     }
+
+    #pragma omp parallel for
     for (int i = 0; i < n * k; ++i) {
-        distances[i] = std::round(distances_f[i]);
+        // Jaccard distance in [0,1] → scale to [0,100] with 2 decimal places
+        // distances[i] = (int32_t)std::lround(distances_f[i] * 100.0f);
+        distances[i] = (int32_t)std::floor(distances_f[i] * 100.0f + 1e-6f);
     }
 }
+
+void IndexBinaryHNSW::search(
+        idx_t n,
+        const void* x,
+        NumericType numeric_type,
+        idx_t k,
+        int32_t* distances,
+        idx_t* labels,
+        const SearchParameters* params) const {
+    IndexBinary::search(n, x, numeric_type, k, distances, labels, params);
+}
+
 
 void IndexBinaryHNSW::add(idx_t n, const uint8_t* x) {
     FAISS_THROW_IF_NOT(is_trained);
     int n0 = ntotal;
     storage->add(n, x);
     ntotal = storage->ntotal;
-
+    
+    ensure_pb_array_();  
+    
     hnsw_add_vertices(*this, n0, n, x, verbose, hnsw.levels.size() == ntotal);
+}
+
+
+void IndexBinaryHNSW::add(idx_t n, const void* x, NumericType numeric_type) {
+    IndexBinary::add(n, x, numeric_type);
 }
 
 void IndexBinaryHNSW::reset() {
     hnsw.reset();
     storage->reset();
+    pb_array_.clear();   
     ntotal = 0;
 }
 
@@ -261,60 +318,223 @@ void IndexBinaryHNSW::reconstruct(idx_t key, uint8_t* recons) const {
     storage->reconstruct(key, recons);
 }
 
+
+void IndexBinaryHNSW::ensure_pb_array_() const {
+    auto* flat = dynamic_cast<const IndexBinaryFlat*>(storage);
+    FAISS_ASSERT(flat);
+    const idx_t new_nt = flat->ntotal;
+    const int  cs      = flat->code_size;
+
+    // Cheap fast-path under the mutex too (to serialize first-time build)
+    std::lock_guard<std::mutex> lock(g_pb_mutex);
+
+    const idx_t old_nt = pb_array_.size();
+    if (new_nt <= old_nt) {
+        return;
+    }
+
+    FAISS_ASSERT(cs % 8 == 0);
+    const int n_words = cs / 8;
+
+    const uint8_t* xb = flat->xb.data();
+    FAISS_ASSERT((idx_t)flat->xb.size() == new_nt * (idx_t)cs);
+
+    pb_array_.reserve(new_nt);
+    pb_array_.resize(new_nt);
+
+    // Now we can parallel-fill safely; no other thread can observe
+    // "size == new_nt" until we're done with this function.
+#pragma omp parallel for if (new_nt - old_nt >= 16384) schedule(static)
+    for (idx_t i = old_nt; i < new_nt; ++i) {
+        const uint64_t* w =
+            reinterpret_cast<const uint64_t*>(xb + i * cs);
+        int s = 0;
+
+    #if defined(__AVX512VPOPCNTDQ__)
+        if (n_words >= 8) {
+            const int vec_limit = (n_words / 8) * 8;
+            for (int j = 0; j < vec_limit; j += 8) {
+                __m512i v  = _mm512_loadu_si512(
+                        reinterpret_cast<const __m512i*>(&w[j]));
+                __m512i pc = _mm512_popcnt_epi64(v);
+                s += (int)_mm512_reduce_add_epi64(pc);
+            }
+            for (int j = vec_limit; j < n_words; ++j) {
+                s += __builtin_popcountll(w[j]);
+            }
+        } else
+    #endif
+        {
+            for (int j = 0; j < n_words; ++j) {
+                s += __builtin_popcountll(w[j]);
+            }
+        }
+
+        pb_array_[i] = (uint16_t)s;
+    }
+}
+
+
 namespace {
 
 template <class HammingComputer>
 struct FlatHammingDis : DistanceComputer {
     const int code_size;
     const uint8_t* b;
+    const uint16_t* pb;  
     size_t ndis;
     HammingComputer hc;
 
-    float operator()(idx_t i) override {
-        ndis++;
-        return hc.hamming(b + i * code_size);
-    }
+    // Example of how to use the non cached version  via the operator
+    // float operator()(idx_t i) override {
+    // ndis++;
+    // float j = hc.jaccard_onthefly(b + i * code_size); // computes pb & px
+    // return 1.0f - j;
+    // }
 
-    float symmetric_dis(idx_t i, idx_t j) override {
-        return HammingComputerDefault(b + j * code_size, code_size)
-                .hamming(b + i * code_size);
-    }
+    //  default one
+float operator()(idx_t i) override {
 
-    explicit FlatHammingDis(const IndexBinaryFlat& storage)
+    ndis++;
+    const uint8_t* bi = b + size_t(i) * code_size;
+    
+    #if defined(__AVX512VPOPCNTDQ__)
+        const uint64_t* a64 = (const uint64_t*)hc.a8;
+        const uint64_t* b64 = (const uint64_t*)bi;
+        
+        __m512i acc = _mm512_setzero_si512();
+        
+        // Unroll and accumulate in vector register
+        for (int blk = 0; blk < 8; ++blk) {
+            __m512i va = _mm512_loadu_si512(&a64[blk * 8]);
+            __m512i vb = _mm512_loadu_si512(&b64[blk * 8]);
+            __m512i vx = _mm512_xor_si512(va, vb);
+            acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(vx));
+        }
+        
+        const int px = _mm512_reduce_add_epi64(acc);
+        const int s = hc.pa_cached + pb[i];
+        const int den_i = s + px;
+        
+    
+        const float den = float(den_i + (den_i == 0));
+        float v = (2.0f * float(px)) / den; 
+
+        return v;
+
+    #endif
+    // Generic fallback
+    const int px = hc.hamming(bi);
+    const int s = hc.pa_cached + pb[i];
+    const int den_i = s + px;
+    const float den = float(den_i + (den_i == 0));
+    float v = (2.0f * float(px)) / den; 
+    return v;
+
+}
+// Example of how to use the non cached version  via the symmetric_dis
+// float symmetric_dis(idx_t i, idx_t j) override {
+// HammingComputerDefault hi(b + i * code_size, code_size);
+// float jacc = hi.jaccard_onthefly(b + j * code_size);
+// return 1.0f - jacc;
+// }
+
+
+float symmetric_dis(idx_t i, idx_t j) override {
+
+    const uint64_t* xi = reinterpret_cast<const uint64_t*>(b + size_t(i) * code_size);
+    const uint64_t* xj = reinterpret_cast<const uint64_t*>(b + size_t(j) * code_size);
+    
+    const int nwords = code_size / 8;
+    int px = 0;
+    
+    #if defined(__AVX512VPOPCNTDQ__)
+    if (nwords >= 8) {
+        __m512i acc = _mm512_setzero_si512();
+        const int vec_limit = (nwords / 8) * 8;
+        
+        for (int blk = 0; blk < vec_limit; blk += 8) {
+            __m512i va = _mm512_loadu_si512(&xi[blk]);
+            __m512i vb = _mm512_loadu_si512(&xj[blk]);
+            __m512i vx = _mm512_xor_si512(va, vb);
+            acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(vx));
+        }
+        
+        px = _mm512_reduce_add_epi64(acc);
+        
+        // Scalar tail
+        for (int k = vec_limit; k < nwords; ++k) {
+            px += __builtin_popcountll(xi[k] ^ xj[k]);
+        }
+    } else {
+        for (int k = 0; k < nwords; ++k) {
+            px += __builtin_popcountll(xi[k] ^ xj[k]);
+        }
+    }
+    #else
+    for (int k = 0; k < nwords; ++k) {
+        px += __builtin_popcountll(xi[k] ^ xj[k]);
+    }
+    #endif
+    
+    const int s = int(pb[i]) + int(pb[j]);
+    const int den_i = s + px;
+    const float den = float(den_i + (den_i == 0));
+    return(2.0f * float(px)) / den; 
+}
+
+
+    explicit FlatHammingDis(const IndexBinaryFlat& storage,const uint16_t* pb_array)
             : code_size(storage.code_size),
               b(storage.xb.data()),
+              pb(pb_array),
               ndis(0),
               hc() {}
+            
+    // void set_query(const float* x) override {
+    //     hc.set((uint8_t*)x, code_size);
+    // }
 
-    // NOTE: Pointers are cast from float in order to reuse the floating-point
-    //   DistanceComputer.
-    void set_query(const float* x) override {
-        hc.set((uint8_t*)x, code_size);
-    }
+    // Consider prefetching in hot loops:
+void set_query(const float* x) override {
+    hc.set((uint8_t*)x, code_size);
+    _mm_prefetch((const char*)b, _MM_HINT_T0);  // Prefetch first vector
+}
 
     ~FlatHammingDis() override {
 #pragma omp critical
-        {
-            hnsw_stats.ndis += ndis;
-        }
+        { hnsw_stats.ndis += ndis; }
     }
 };
 
+
 struct BuildDistanceComputer {
     using T = DistanceComputer*;
+        const uint16_t* pb;                   // <-- hold pb pointer
+        explicit BuildDistanceComputer(const uint16_t* pb_) : pb(pb_) {}
     template <class HammingComputer>
     DistanceComputer* f(IndexBinaryFlat* flat_storage) {
-        return new FlatHammingDis<HammingComputer>(*flat_storage);
+        return new FlatHammingDis<HammingComputer>(*flat_storage,pb);
     }
 };
 
 } // namespace
 
+
+
 DistanceComputer* IndexBinaryHNSW::get_distance_computer() const {
-    IndexBinaryFlat* flat_storage = dynamic_cast<IndexBinaryFlat*>(storage);
-    FAISS_ASSERT(flat_storage != nullptr);
-    BuildDistanceComputer bd;
-    return dispatch_HammingComputer(code_size, bd, flat_storage);
+    auto* flat = dynamic_cast<IndexBinaryFlat*>(storage);
+    FAISS_ASSERT(flat);
+    // Only compute if array is stale (works for both add and load scenarios)
+    if (pb_array_.size() < (size_t)flat->ntotal) {
+        ensure_pb_array_();  // Builds entire array from scratch on first call
+    }
+
+    FAISS_ASSERT((idx_t)pb_array_.size() >= flat->ntotal); // pb ready
+
+
+    BuildDistanceComputer bd(pb_array_.data());
+    return dispatch_HammingComputer(code_size, bd, flat);
 }
 
 /**************************************************************

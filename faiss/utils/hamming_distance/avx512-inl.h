@@ -23,6 +23,11 @@
 
 #include <immintrin.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+
+
 namespace faiss {
 
 /* Elementary Hamming distance computation: unoptimized  */
@@ -78,6 +83,73 @@ inline hamdis_t hamming(
     return h;
 }
 
+
+// ---- helpers ----
+static inline uint32_t popcnt64_scalar(uint64_t x) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    return (uint32_t)__popcnt64(x);
+#else
+    return (uint32_t)__builtin_popcountll((unsigned long long)x);
+#endif
+}
+
+// popcount of an arbitrary-length bitmap in bytes (handles 4096 bits = 512 bytes too)
+static inline int total_popcnt_bytes_avx512(const uint8_t* a8, int nbytes) {
+    const uint64_t* a64 = reinterpret_cast<const uint64_t*>(a8);
+    int n_words = nbytes / 8;
+    int rem     = nbytes % 8;
+    int sum = 0;
+
+#if defined(__AVX512VPOPCNTDQ__)
+    int i = 0;
+    int blocks = n_words / 8;               // 8x u64 per 512-bit block
+    for (; i < blocks; ++i) {
+        __m512i va = _mm512_loadu_si512((const void*)&a64[i*8]);
+        __m512i pc = _mm512_popcnt_epi64(va);
+        alignas(64) uint64_t tmp[8];
+        _mm512_store_si512((__m512i*)tmp, pc);
+        sum += int(tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7]);
+    }
+    int off = blocks * 8;
+    for (int j = off; j < n_words; ++j) sum += popcount64(a64[j]);
+#else
+    for (int j = 0; j < n_words; ++j) sum += popcount64(a64[j]);
+#endif
+    // byte tail (rare for 4096-bit bitmaps) xxx xxx
+    if (rem) {
+        const uint8_t* p = a8 + 8 * n_words;
+        static const uint8_t lut[256] = {
+            #define B2(n) n, n+1, n+1, n+2
+            #define B4(n) B2(n), B2(n+1), B2(n+1), B2(n+2)
+            #define B6(n) B4(n), B4(n+1), B4(n+1), B4(n+2)
+            B6(0), B6(1), B6(1), B6(2)
+            #undef B6
+            #undef B4
+            #undef B2
+        };
+        for (int k = 0; k < rem; ++k) sum += lut[p[k]];
+    }
+    return sum;
+}
+
+static inline uint32_t popcount32_u(uint32_t x) {
+#if defined(_MSC_VER)
+    return (uint32_t)__popcnt(x);
+#else
+    return (uint32_t)__builtin_popcount(x);
+#endif
+}
+
+
+
+static inline int hsum8_u64(__m512i v) {
+    alignas(64) uint64_t t[8];
+    _mm512_store_si512((__m512i*)t, v);
+    return int(t[0]+t[1]+t[2]+t[3]+t[4]+t[5]+t[6]+t[7]);
+}
+
+
+
 /******************************************************************
  * The HammingComputer series of classes compares a single code of
  * size 4 to 32 to incoming codes. They are intended for use as a
@@ -87,291 +159,441 @@ inline hamdis_t hamming(
  ******************************************************************/
 
 struct HammingComputer4 {
-    uint32_t a0;
+    uint32_t a0 = 0;
+    int pa_cached = 0;
 
     HammingComputer4() {}
-
-    HammingComputer4(const uint8_t* a, int code_size) {
-        set(a, code_size);
-    }
+    HammingComputer4(const uint8_t* a, int code_size) { set(a, code_size); }
 
     void set(const uint8_t* a, int code_size) {
         assert(code_size == 4);
-        a0 = *(uint32_t*)a;
+        memcpy(&a0, a, 4);
+        pa_cached = (int)popcount32_u(a0); // or popcount32(a0)
     }
 
     inline int hamming(const uint8_t* b) const {
-        return popcount64(*(uint32_t*)b ^ a0);
+        uint32_t b0;
+        memcpy(&b0, b, 4);
+        return (int)popcount32_u(b0 ^ a0);
     }
 
-    inline static constexpr int get_code_size() {
-        return 4;
+    inline float jaccard_with_pb(const uint8_t* b, int pb) const {
+        const int px = hamming(b);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
     }
+
+    inline float jaccard_onthefly(const uint8_t* b) const {
+        uint32_t b0;
+        memcpy(&b0, b, 4);
+        const int pb = (int)popcount32_u(b0);
+        const int px = (int)popcount32_u(b0 ^ a0);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
+    }
+
+    inline static constexpr int get_code_size() { return 4; }
 };
 
+
 struct HammingComputer8 {
-    uint64_t a0;
+    uint64_t a0 = 0;
+    int pa_cached = 0;
 
     HammingComputer8() {}
-
-    HammingComputer8(const uint8_t* a, int code_size) {
-        set(a, code_size);
-    }
+    HammingComputer8(const uint8_t* a, int code_size) { set(a, code_size); }
 
     void set(const uint8_t* a, int code_size) {
         assert(code_size == 8);
-        a0 = *(uint64_t*)a;
+        memcpy(&a0, a, 8);
+        pa_cached = (int)popcount64(a0);
     }
 
     inline int hamming(const uint8_t* b) const {
-        return popcount64(*(uint64_t*)b ^ a0);
+        uint64_t b0;
+        memcpy(&b0, b, 8);
+        return (int)popcount64(b0 ^ a0);
     }
 
-    inline static constexpr int get_code_size() {
-        return 8;
+    inline float jaccard_with_pb(const uint8_t* b, int pb) const {
+        const int px = hamming(b);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
     }
+
+    inline float jaccard_onthefly(const uint8_t* b) const {
+        uint64_t b0;
+        memcpy(&b0, b, 8);
+        const int pb = (int)popcount64(b0);
+        const int px = (int)popcount64(b0 ^ a0);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
+    }
+
+    inline static constexpr int get_code_size() { return 8; }
 };
 
+
 struct HammingComputer16 {
-    uint64_t a0, a1;
+    uint64_t a0 = 0, a1 = 0;
+    int pa_cached = 0;
 
     HammingComputer16() {}
-
-    HammingComputer16(const uint8_t* a8, int code_size) {
-        set(a8, code_size);
-    }
+    HammingComputer16(const uint8_t* a8, int code_size) { set(a8, code_size); }
 
     void set(const uint8_t* a8, int code_size) {
         assert(code_size == 16);
-        const uint64_t* a = (uint64_t*)a8;
-        a0 = a[0];
-        a1 = a[1];
+        memcpy(&a0, a8 + 0, 8);
+        memcpy(&a1, a8 + 8, 8);
+        pa_cached = (int)(popcount64(a0) + popcount64(a1));
     }
 
     inline int hamming(const uint8_t* b8) const {
-        const uint64_t* b = (uint64_t*)b8;
-        return popcount64(b[0] ^ a0) + popcount64(b[1] ^ a1);
+        uint64_t b0, b1;
+        memcpy(&b0, b8 + 0, 8);
+        memcpy(&b1, b8 + 8, 8);
+        return (int)(popcount64(b0 ^ a0) + popcount64(b1 ^ a1));
     }
 
-    inline static constexpr int get_code_size() {
-        return 16;
+    inline float jaccard_with_pb(const uint8_t* b8, int pb) const {
+        const int px = hamming(b8);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
     }
+
+    inline float jaccard_onthefly(const uint8_t* b8) const {
+        uint64_t b0, b1;
+        memcpy(&b0, b8 + 0, 8);
+        memcpy(&b1, b8 + 8, 8);
+        const int pb = (int)(popcount64(b0) + popcount64(b1));
+        const int px = (int)(popcount64(b0 ^ a0) + popcount64(b1 ^ a1));
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
+    }
+
+    inline static constexpr int get_code_size() { return 16; }
 };
+
 
 // when applied to an array, 1/2 of the 64-bit accesses are unaligned.
 // This incurs a penalty of ~10% wrt. fully aligned accesses.
 struct HammingComputer20 {
-    uint64_t a0, a1;
-    uint32_t a2;
+    uint64_t a0 = 0, a1 = 0;
+    uint32_t a2 = 0;
+    int pa_cached = 0;
 
     HammingComputer20() {}
-
-    HammingComputer20(const uint8_t* a8, int code_size) {
-        set(a8, code_size);
-    }
+    HammingComputer20(const uint8_t* a8, int code_size) { set(a8, code_size); }
 
     void set(const uint8_t* a8, int code_size) {
         assert(code_size == 20);
-        const uint64_t* a = (uint64_t*)a8;
-        a0 = a[0];
-        a1 = a[1];
-        a2 = a[2];
+        memcpy(&a0, a8 + 0, 8);
+        memcpy(&a1, a8 + 8, 8);
+        memcpy(&a2, a8 + 16, 4);
+        pa_cached = (int)(popcount64(a0) + popcount64(a1) + popcount32_u(a2));
     }
 
     inline int hamming(const uint8_t* b8) const {
-        const uint64_t* b = (uint64_t*)b8;
-        return popcount64(b[0] ^ a0) + popcount64(b[1] ^ a1) +
-                popcount64(*(uint32_t*)(b + 2) ^ a2);
+        uint64_t b0, b1;
+        uint32_t b2;
+        memcpy(&b0, b8 + 0, 8);
+        memcpy(&b1, b8 + 8, 8);
+        memcpy(&b2, b8 + 16, 4);
+        return (int)(popcount64(b0 ^ a0) + popcount64(b1 ^ a1) + popcount32_u(b2 ^ a2));
     }
 
-    inline static constexpr int get_code_size() {
-        return 20;
+    inline float jaccard_with_pb(const uint8_t* b8, int pb) const {
+        const int px = hamming(b8);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
     }
+
+    inline float jaccard_onthefly(const uint8_t* b8) const {
+        uint64_t b0, b1;
+        uint32_t b2;
+        memcpy(&b0, b8 + 0, 8);
+        memcpy(&b1, b8 + 8, 8);
+        memcpy(&b2, b8 + 16, 4);
+        const int pb = (int)(popcount64(b0) + popcount64(b1) + popcount32_u(b2));
+        const int px = (int)(popcount64(b0 ^ a0) + popcount64(b1 ^ a1) + popcount32_u(b2 ^ a2));
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
+    }
+
+    inline static constexpr int get_code_size() { return 20; }
 };
 
+
 struct HammingComputer32 {
-    uint64_t a0, a1, a2, a3;
+    uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    int pa_cached = 0;
 
     HammingComputer32() {}
-
-    HammingComputer32(const uint8_t* a8, int code_size) {
-        set(a8, code_size);
-    }
+    HammingComputer32(const uint8_t* a8, int code_size) { set(a8, code_size); }
 
     void set(const uint8_t* a8, int code_size) {
         assert(code_size == 32);
-        const uint64_t* a = (uint64_t*)a8;
-        a0 = a[0];
-        a1 = a[1];
-        a2 = a[2];
-        a3 = a[3];
+        memcpy(&a0, a8 + 0, 8);
+        memcpy(&a1, a8 + 8, 8);
+        memcpy(&a2, a8 + 16, 8);
+        memcpy(&a3, a8 + 24, 8);
+        pa_cached = (int)(popcount64(a0) + popcount64(a1) + popcount64(a2) + popcount64(a3));
     }
 
     inline int hamming(const uint8_t* b8) const {
-        const uint64_t* b = (uint64_t*)b8;
-        return popcount64(b[0] ^ a0) + popcount64(b[1] ^ a1) +
-                popcount64(b[2] ^ a2) + popcount64(b[3] ^ a3);
+        uint64_t b0, b1, b2, b3;
+        memcpy(&b0, b8 + 0, 8);
+        memcpy(&b1, b8 + 8, 8);
+        memcpy(&b2, b8 + 16, 8);
+        memcpy(&b3, b8 + 24, 8);
+        return (int)(popcount64(b0 ^ a0) + popcount64(b1 ^ a1) +
+                     popcount64(b2 ^ a2) + popcount64(b3 ^ a3));
     }
 
-    inline static constexpr int get_code_size() {
-        return 32;
+    inline float jaccard_with_pb(const uint8_t* b8, int pb) const {
+        const int px = hamming(b8);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
     }
+
+    inline float jaccard_onthefly(const uint8_t* b8) const {
+        uint64_t b0, b1, b2, b3;
+        memcpy(&b0, b8 + 0, 8);
+        memcpy(&b1, b8 + 8, 8);
+        memcpy(&b2, b8 + 16, 8);
+        memcpy(&b3, b8 + 24, 8);
+        const int pb = (int)(popcount64(b0) + popcount64(b1) + popcount64(b2) + popcount64(b3));
+        const int px = (int)(popcount64(b0 ^ a0) + popcount64(b1 ^ a1) +
+                             popcount64(b2 ^ a2) + popcount64(b3 ^ a3));
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
+    }
+
+    inline static constexpr int get_code_size() { return 32; }
 };
+
 
 struct HammingComputer64 {
     uint64_t a0, a1, a2, a3, a4, a5, a6, a7;
-    const uint64_t* a;
+    const uint64_t* a = nullptr;
+    int pa_cached = 0;
 
     HammingComputer64() {}
-
-    HammingComputer64(const uint8_t* a8, int code_size) {
-        set(a8, code_size);
-    }
+    HammingComputer64(const uint8_t* a8, int code_size) { set(a8, code_size); }
 
     void set(const uint8_t* a8, int code_size) {
         assert(code_size == 64);
-        a = (uint64_t*)a8;
-        a0 = a[0];
-        a1 = a[1];
-        a2 = a[2];
-        a3 = a[3];
-        a4 = a[4];
-        a5 = a[5];
-        a6 = a[6];
-        a7 = a[7];
+        a = (const uint64_t*)a8;
+        a0 = a[0]; a1 = a[1]; a2 = a[2]; a3 = a[3];
+        a4 = a[4]; a5 = a[5]; a6 = a[6]; a7 = a[7];
+        pa_cached = (int)(popcount64(a0)+popcount64(a1)+popcount64(a2)+popcount64(a3)+
+                          popcount64(a4)+popcount64(a5)+popcount64(a6)+popcount64(a7));
     }
 
     inline int hamming(const uint8_t* b8) const {
-        const uint64_t* b = (uint64_t*)b8;
-#ifdef __AVX512VPOPCNTDQ__
-        __m512i vxor =
-                _mm512_xor_si512(_mm512_loadu_si512(a), _mm512_loadu_si512(b));
-        __m512i vpcnt = _mm512_popcnt_epi64(vxor);
-        // reduce performs better than adding the lower and higher parts
-        return _mm512_reduce_add_epi32(vpcnt);
-#else
-        return popcount64(b[0] ^ a0) + popcount64(b[1] ^ a1) +
-                popcount64(b[2] ^ a2) + popcount64(b[3] ^ a3) +
-                popcount64(b[4] ^ a4) + popcount64(b[5] ^ a5) +
-                popcount64(b[6] ^ a6) + popcount64(b[7] ^ a7);
-#endif
+        const uint64_t* b = (const uint64_t*)b8;
+    #ifdef __AVX512VPOPCNTDQ__
+        __m512i vxor = _mm512_xor_si512(_mm512_loadu_si512(a), _mm512_loadu_si512(b));
+        __m512i vpc  = _mm512_popcnt_epi64(vxor);
+        return _mm512_reduce_add_epi32(vpc);
+    #else
+        return (int)(popcount64(b[0]^a0)+popcount64(b[1]^a1)+popcount64(b[2]^a2)+popcount64(b[3]^a3)+
+                     popcount64(b[4]^a4)+popcount64(b[5]^a5)+popcount64(b[6]^a6)+popcount64(b[7]^a7));
+    #endif
     }
 
-    inline static constexpr int get_code_size() {
-        return 64;
+    inline float jaccard_with_pb(const uint8_t* b8, int pb) const {
+        const int px = hamming(b8);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
     }
+
+    inline float jaccard_onthefly(const uint8_t* b8) const {
+        const uint64_t* b = (const uint64_t*)b8;
+        int pb = 0, px = 0;
+    #ifdef __AVX512VPOPCNTDQ__
+        __m512i vb   = _mm512_loadu_si512(b);
+        __m512i va   = _mm512_loadu_si512(a);
+        __m512i vxor = _mm512_xor_si512(va, vb);
+        pb = _mm512_reduce_add_epi32(_mm512_popcnt_epi64(vb));
+        px = _mm512_reduce_add_epi32(_mm512_popcnt_epi64(vxor));
+    #else
+        pb = (int)(popcount64(b[0])+popcount64(b[1])+popcount64(b[2])+popcount64(b[3])+
+                   popcount64(b[4])+popcount64(b[5])+popcount64(b[6])+popcount64(b[7]));
+        px = (int)(popcount64(b[0]^a0)+popcount64(b[1]^a1)+popcount64(b[2]^a2)+popcount64(b[3]^a3)+
+                   popcount64(b[4]^a4)+popcount64(b[5]^a5)+popcount64(b[6]^a6)+popcount64(b[7]^a7));
+    #endif
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
+    }
+
+    inline static constexpr int get_code_size() { return 64; }
 };
 
 struct HammingComputerDefault {
-    const uint8_t* a8;
-    int quotient8;
-    int remainder8;
-
+    const uint8_t* a8 = nullptr;
+    int quotient8 = 0, remainder8 = 0;
+    int pa_cached = 0;                 // <-- cached once per query
     HammingComputerDefault() {}
-
-    HammingComputerDefault(const uint8_t* a8, int code_size) {
-        set(a8, code_size);
-    }
+    HammingComputerDefault(const uint8_t* a8_, int code_size) { set(a8_, code_size); }
 
     void set(const uint8_t* a8_2, int code_size) {
-        this->a8 = a8_2;
+        a8 = a8_2;
         quotient8 = code_size / 8;
         remainder8 = code_size % 8;
+        // compute pa ONCE here (uses a8, not a64)
+        pa_cached = total_popcnt_bytes_avx512(a8, code_size);
     }
 
+    // Fast Hamming using XOR+popcnt; AVX-512 path if available
     int hamming(const uint8_t* b8) const {
         int accu = 0;
-
         const uint64_t* a64 = reinterpret_cast<const uint64_t*>(a8);
         const uint64_t* b64 = reinterpret_cast<const uint64_t*>(b8);
-
+        
         int i = 0;
-#ifdef __AVX512VPOPCNTDQ__
-        int quotient64 = quotient8 / 8;
-        for (; i < quotient64; ++i) {
-            __m512i vxor = _mm512_xor_si512(
-                    _mm512_loadu_si512(&a64[i * 8]),
-                    _mm512_loadu_si512(&b64[i * 8]));
-            __m512i vpcnt = _mm512_popcnt_epi64(vxor);
-            // reduce performs better than adding the lower and higher parts
-            accu += _mm512_reduce_add_epi32(vpcnt);
-        }
-        i *= 8;
-#endif
+        #if defined(__AVX512VPOPCNTDQ__)
+            int blocks = quotient8 / 8; // 512-bit blocks
+
+            for (; i < blocks; ++i) {
+                __m512i va = _mm512_loadu_si512((const void*)&a64[i*8]);
+                __m512i vb = _mm512_loadu_si512((const void*)&b64[i*8]);
+                __m512i vx = _mm512_xor_si512(va, vb);
+                __m512i pc = _mm512_popcnt_epi64(vx);
+                alignas(64) uint64_t tmp[8];
+                _mm512_store_si512((__m512i*)tmp, pc);
+                accu += int(tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7]);
+            }
+            i *= 8; // words consumed
+        #endif
+
+        // scalar tail (Duff style)
         int len = quotient8 - i;
         switch (len & 7) {
-            default:
-                while (len > 7) {
-                    len -= 8;
-                    accu += popcount64(a64[i] ^ b64[i]);
-                    i++;
-                    [[fallthrough]];
-                    case 7:
-                        accu += popcount64(a64[i] ^ b64[i]);
-                        i++;
-                        [[fallthrough]];
-                    case 6:
-                        accu += popcount64(a64[i] ^ b64[i]);
-                        i++;
-                        [[fallthrough]];
-                    case 5:
-                        accu += popcount64(a64[i] ^ b64[i]);
-                        i++;
-                        [[fallthrough]];
-                    case 4:
-                        accu += popcount64(a64[i] ^ b64[i]);
-                        i++;
-                        [[fallthrough]];
-                    case 3:
-                        accu += popcount64(a64[i] ^ b64[i]);
-                        i++;
-                        [[fallthrough]];
-                    case 2:
-                        accu += popcount64(a64[i] ^ b64[i]);
-                        i++;
-                        [[fallthrough]];
-                    case 1:
-                        accu += popcount64(a64[i] ^ b64[i]);
-                        i++;
-                }
+        default:
+            while (len > 7) {
+                len -= 8;
+                accu += popcount64(a64[i] ^ b64[i]); ++i;
+                [[fallthrough]];
+            case 7: accu += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 6: accu += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 5: accu += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 4: accu += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 3: accu += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 2: accu += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 1: accu += popcount64(a64[i] ^ b64[i]); ++i;
+            }
         }
+        // byte tail (rare for 4096-bit)
         if (remainder8) {
             const uint8_t* a = a8 + 8 * quotient8;
             const uint8_t* b = b8 + 8 * quotient8;
+            static const uint8_t lut[256] = {/* same 256-entry popcnt table as above */};
             switch (remainder8) {
-                case 7:
-                    accu += hamdis_tab_ham_bytes[a[6] ^ b[6]];
-                    [[fallthrough]];
-                case 6:
-                    accu += hamdis_tab_ham_bytes[a[5] ^ b[5]];
-                    [[fallthrough]];
-                case 5:
-                    accu += hamdis_tab_ham_bytes[a[4] ^ b[4]];
-                    [[fallthrough]];
-                case 4:
-                    accu += hamdis_tab_ham_bytes[a[3] ^ b[3]];
-                    [[fallthrough]];
-                case 3:
-                    accu += hamdis_tab_ham_bytes[a[2] ^ b[2]];
-                    [[fallthrough]];
-                case 2:
-                    accu += hamdis_tab_ham_bytes[a[1] ^ b[1]];
-                    [[fallthrough]];
-                case 1:
-                    accu += hamdis_tab_ham_bytes[a[0] ^ b[0]];
-                    [[fallthrough]];
-                default:
-                    break;
+            case 7: accu += lut[a[6] ^ b[6]]; [[fallthrough]];
+            case 6: accu += lut[a[5] ^ b[5]]; [[fallthrough]];
+            case 5: accu += lut[a[4] ^ b[4]]; [[fallthrough]];
+            case 4: accu += lut[a[3] ^ b[3]]; [[fallthrough]];
+            case 3: accu += lut[a[2] ^ b[2]]; [[fallthrough]];
+            case 2: accu += lut[a[1] ^ b[1]]; [[fallthrough]];
+            case 1: accu += lut[a[0] ^ b[0]]; [[fallthrough]];
+            default: break;
             }
         }
-
-        return accu;
+        return accu; // px (Hamming)
     }
 
-    inline int get_code_size() const {
-        return quotient8 * 8 + remainder8;
+    // Optional: Jaccard using cached pa and a precomputed/stored pb
+    float jaccard_with_pbxx(const uint8_t* b8, int pb) const {
+        int px = hamming(b8);
+        int num = (pa_cached + pb - px);
+        int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
     }
+
+
+    // ---------- Jaccard (fast path: requires precomputed pb per doc) ----------
+    float jaccard_with_pb(const uint8_t* b8, int pb) const {
+        const int px = hamming(b8);
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
+    }
+
+    // ---------- Jaccard (on-the-fly: compute pb + px together) ----------
+    float jaccard_onthefly(const uint8_t* b8) const {
+        const uint64_t* a64 = reinterpret_cast<const uint64_t*>(a8);
+        const uint64_t* b64 = reinterpret_cast<const uint64_t*>(b8);
+        int i = 0, pb = 0, px = 0;
+
+    #if defined(__AVX512VPOPCNTDQ__)
+        int blocks = quotient8 / 8;
+        for (; i < blocks; ++i) {
+            __m512i va = _mm512_loadu_si512((const void*)&a64[i*8]);
+            __m512i vb = _mm512_loadu_si512((const void*)&b64[i*8]);
+            __m512i vx = _mm512_xor_si512(va, vb);
+
+            __m512i pcb = _mm512_popcnt_epi64(vb);
+            __m512i pcx = _mm512_popcnt_epi64(vx);
+
+            pb += hsum8_u64(pcb);
+            px += hsum8_u64(pcx);
+        }
+        i *= 8;
+    #endif
+        int len = quotient8 - i;
+        switch (len & 7) {
+        default:
+            while (len > 7) {
+                len -= 8;
+                pb += popcnt64_scalar(b64[i]);
+                px += popcnt64_scalar(a64[i] ^ b64[i]);
+                ++i;
+                [[fallthrough]];
+            case 7: pb += popcount64(b64[i]); px += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 6: pb += popcount64(b64[i]); px += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 5: pb += popcount64(b64[i]); px += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 4: pb += popcount64(b64[i]); px += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 3: pb += popcount64(b64[i]); px += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 2: pb += popcount64(b64[i]); px += popcount64(a64[i] ^ b64[i]); ++i; [[fallthrough]];
+            case 1: pb += popcount64(b64[i]); px += popcount64(a64[i] ^ b64[i]); ++i;
+            }
+        }
+        if (remainder8) {
+            extern const uint8_t hamdis_tab_ham_bytes[256];
+            const uint8_t* a = a8 + 8 * quotient8;
+            const uint8_t* b = b8 + 8 * quotient8;
+            switch (remainder8) {
+            case 7: pb += hamdis_tab_ham_bytes[b[6]]; px += hamdis_tab_ham_bytes[a[6] ^ b[6]]; [[fallthrough]];
+            case 6: pb += hamdis_tab_ham_bytes[b[5]]; px += hamdis_tab_ham_bytes[a[5] ^ b[5]]; [[fallthrough]];
+            case 5: pb += hamdis_tab_ham_bytes[b[4]]; px += hamdis_tab_ham_bytes[a[4] ^ b[4]]; [[fallthrough]];
+            case 4: pb += hamdis_tab_ham_bytes[b[3]]; px += hamdis_tab_ham_bytes[a[3] ^ b[3]]; [[fallthrough]];
+            case 3: pb += hamdis_tab_ham_bytes[b[2]]; px += hamdis_tab_ham_bytes[a[2] ^ b[2]]; [[fallthrough]];
+            case 2: pb += hamdis_tab_ham_bytes[b[1]]; px += hamdis_tab_ham_bytes[a[1] ^ b[1]]; [[fallthrough]];
+            case 1: pb += hamdis_tab_ham_bytes[b[0]]; px += hamdis_tab_ham_bytes[a[0] ^ b[0]]; [[fallthrough]];
+            default: break;
+            }
+        }
+        const int num = (pa_cached + pb - px);
+        const int den = (pa_cached + pb + px);
+        return den ? float(num) / float(den) : 1.0f;
+    }
+
+    inline int get_code_size() const { return quotient8 * 8 + remainder8; }
 };
+
 
 /***************************************************************************
  * generalized Hamming = number of bytes that are different between
